@@ -147,7 +147,10 @@ class Relationships {
 
   tool(event: SessionFormatEvent, data: SessionFormatJsonObject): void {
     if (event.type === 'tool/result' && event['surfaceOp'] !== 'append') {
-      this.requireTurn(event.type)
+      // Released pruning can run between turns (for example after a fork).
+      // Admit only its adjacent, single-result shadow-price protocol. This is
+      // a surface rewrite, not a newly completed tool call outside a turn.
+      if (this.turn === null && !this.isPrunedToolReplacement(event, data)) this.requireTurn(event.type)
       return
     }
     this.requireStep(event, data)
@@ -177,6 +180,25 @@ class Relationships {
       }
       this.tools.delete(id)
     }
+  }
+
+  isPrunedToolReplacement(event: SessionFormatEvent, data: SessionFormatJsonObject): boolean {
+    const operation = record(event['surfaceOp'], 'tool/result replacement')
+    const targetSeq = operation['startSeq']
+    if (operation['op'] !== 'replace' || typeof targetSeq !== 'number' || operation['endSeq'] !== targetSeq) return false
+    const original = this.artifact.events[targetSeq]
+    const marker = this.artifact.events[event.seq - 1]
+    if (original?.type !== 'tool/result' || marker?.type !== 'compaction/prune') return false
+    const priced = record(marker.data, 'compaction/prune data')
+    const range = record(priced['shadowedRange'], 'compaction/prune range')
+    if (range['start'] !== targetSeq || range['end'] !== targetSeq
+      || !isDeepStrictEqual(priced['shadowedSeqs'], [targetSeq])
+      || !isDeepStrictEqual(event['sourceEventSeqs'], [targetSeq])) return false
+    const { message: originalMessage, ...originalMeta } = record(original.data, 'original tool/result')
+    const { message: replacementMessage, ...replacementMeta } = data
+    const { content: _originalContent, ...originalIdentity } = record(originalMessage, 'original tool message')
+    const { content: _replacementContent, ...replacementIdentity } = record(replacementMessage, 'replacement tool message')
+    return isDeepStrictEqual(originalMeta, replacementMeta) && isDeepStrictEqual(originalIdentity, replacementIdentity)
   }
 
   dispatch(event: SessionFormatEvent, data: SessionFormatJsonObject): void {

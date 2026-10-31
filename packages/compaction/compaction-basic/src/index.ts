@@ -29,6 +29,22 @@ import {
 } from './region.ts'
 import { summarizeWithLlm } from './summarizer.ts'
 import type { SummarizationInput, SummaryResult } from './summarizer.ts'
+export type { SummarizationInput } from './summarizer.ts'
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /** Resolve logical pressure capacity for an automatically routed model family. */
+    'compaction/pressure-target'(
+      payload: { agent: Agent; target: Pick<LlmCallConfig, 'provider' | 'model'>; signal?: AbortSignal },
+      next: () => Promise<Pick<LlmCallConfig, 'provider' | 'model'>>,
+    ): Promise<Pick<LlmCallConfig, 'provider' | 'model'>>
+    /** Transform only the summarizer input; never mutate the durable selection. */
+    'compaction/summarize-input'(
+      payload: { agent: Agent; input: SummarizationInput; signal?: AbortSignal },
+      next: () => Promise<SummarizationInput>,
+    ): Promise<SummarizationInput>
+  }
+}
 import type {
   BasicCompactionConfig,
   ModelCompactPolicyConfig,
@@ -271,8 +287,13 @@ export class BasicCompactionEngine extends CompactionEngine {
     trigger: CompactionTrigger,
     signal: AbortSignal,
   ): Promise<CompactionResult | null> {
-    const target = routedTarget(agent.session)
-    if (target === undefined) return null
+    const routed = routedTarget(agent.session)
+    if (routed === undefined) return null
+    const target = trigger === 'pressure'
+      ? await this.ctx.waterfall('compaction/pressure-target', {
+          agent, target: routed, ...(signal === undefined ? {} : { signal }),
+        }, () => Promise.resolve(routed))
+      : routed
     const policy = resolveTargetPolicy(this.config, target)
     const meter = this.ctx.tokenMeter
     let measurement = meter.measure(agent.session)
@@ -438,7 +459,13 @@ export class BasicCompactionEngine extends CompactionEngine {
   private regionDependencies(): Parameters<typeof compactSurfaceRegion>[0] {
     return {
       meter: this.ctx.tokenMeter,
-      summarize: (input, owner, abort) => this.summarize(input, owner, abort),
+      summarize: async (input, owner, abort) => {
+        const filtered = await this.ctx.waterfall('compaction/summarize-input', {
+          agent: owner, input, ...abort === undefined ? {} : { signal: abort },
+        }, () => Promise.resolve(input))
+        abort?.throwIfAborted()
+        return this.summarize(filtered, owner, abort)
+      },
       recover: (error, agent, sourceEventSeqs, signal) => this.ctx.waterfall('compaction/summary-error', {
         session: agent.session,
         sourceEventSeqs,

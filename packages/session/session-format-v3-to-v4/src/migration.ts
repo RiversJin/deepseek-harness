@@ -51,6 +51,7 @@ class ReleasedV3ToV4Stage implements SessionFormatMigrationStage {
   private nextSeq = 0
   private time: number
   private foreignDeliverySeq: number | undefined
+  private readonly inboxCounts = { 'next-turn': 0, 'next-step': 0 }
 
   constructor(private readonly input: SessionFormatMigrationStageInput, children: readonly SessionFormatJsonValue[]) {
     this.candidates = children.map(childCatalogSource).sort((left, right) =>
@@ -64,6 +65,7 @@ class ReleasedV3ToV4Stage implements SessionFormatMigrationStage {
 
   transformEvent(event: SessionFormatEvent, context: SessionFormatMigrationContext): void {
     if (event.seq !== this.mapping.length) throw new SessionFormatError('V3 source events must be dense')
+    this.normalizeLegacyInboxBoundary(event, context)
     const interrupted = this.observeRestart(event)
     if (interrupted !== undefined) {
       context.emitEvent({ type: 'turn/end', seq: this.nextSeq++, time: event.time,
@@ -112,6 +114,34 @@ class ReleasedV3ToV4Stage implements SessionFormatMigrationStage {
 
   transformRun(run: SessionFormatEventRun, context: SessionFormatMigrationContext): void {
     for (const event of run.expand()) this.transformEvent(event, context)
+  }
+
+  /**
+   * Legacy Inbox reconstruction began after the latest seed boundary. V4 folds
+   * inherited queue events too, so express each old reset as ordinary removals.
+   * Keep every source event/message and remap its references through the normal
+   * sequence map. Native V4 forks never pass through this migration.
+   */
+  private normalizeLegacyInboxBoundary(event: SessionFormatEvent, context: SessionFormatMigrationContext): void {
+    if (event.type === 'session/end-seed') {
+      for (const target of ['next-step', 'next-turn'] as const) {
+        const removedCount = this.inboxCounts[target]
+        if (removedCount === 0) continue
+        context.emitEvent({ type: 'agent/inbox/spliced', seq: this.nextSeq++, time: event.time,
+          data: { target, start: 0, removedCount, inserted: [] } })
+        this.inboxCounts[target] = 0
+      }
+      return
+    }
+    if (event.type !== 'agent/inbox/spliced' || !isSessionFormatJsonObject(event.data)) return
+    const { target, start, removedCount = 0, inserted } = event.data
+    if (target !== 'next-turn' && target !== 'next-step') throw new SessionFormatError('invalid legacy inbox target')
+    const offset = sessionFormatCount(start, 'legacy inbox start')
+    const removed = sessionFormatCount(removedCount, 'legacy inbox removedCount')
+    if (!Array.isArray(inserted) || offset + removed > this.inboxCounts[target]) {
+      throw new SessionFormatError(`invalid legacy inbox splice at source seq ${event.seq}`)
+    }
+    this.inboxCounts[target] += inserted.length - removed
   }
 
   private observeRestart(event: SessionFormatEvent): number | undefined {

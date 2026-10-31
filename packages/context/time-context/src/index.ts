@@ -37,17 +37,59 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
   }
 }
 
-const timeContextStateSchema = zod.object({
+const clockStateSchema = zod.object({
   /** Time of the latest model-visible event (user/assistant message, tool result), or null. */
   lastMessageTime: zod.number().nullable(),
   /** Time of this plugin's latest durable injection, or null. */
   lastInjectionTime: zod.number().nullable(),
+  /** Surface node of the latest durable injection, for detecting context rewrites. */
+  lastInjectionSeq: zod.number().int().nonnegative().nullable(),
   /** Latest injection time in the open turn, or null before that turn receives one. */
   lastTurnInjectionTime: zod.number().nullable(),
+  /** Real user messages appended after the latest durable injection. */
+  userMessagesSinceInjection: zod.number().int().nonnegative(),
 })
 
+const timeContextStateSchema = clockStateSchema.extend({
+  openTurn: zod.number().int().nullable(),
+  /** Clock state before the latest admitted user turn, for whole-turn retry. */
+  request: zod.object({
+    startSeq: zod.number().int().nonnegative(),
+    turn: zod.number().int().nullable(),
+    before: clockStateSchema,
+  }).nullable(),
+})
+
+type ClockState = zod.infer<typeof clockStateSchema>
 /** Folded time-context readings. */
 type TimeContextProjection = zod.infer<typeof timeContextStateSchema>
+
+function clockState(state: ClockState): ClockState {
+  return {
+    lastMessageTime: state.lastMessageTime,
+    lastInjectionTime: state.lastInjectionTime,
+    lastInjectionSeq: state.lastInjectionSeq,
+    lastTurnInjectionTime: state.lastTurnInjectionTime,
+    userMessagesSinceInjection: state.userMessagesSinceInjection,
+  }
+}
+
+/** Evaluate a proposed retry against its pending retraction without committing it. */
+function requestClock(state: TimeContextProjection, messages: readonly UserMessage[]): ClockState {
+  const checkpoint = state.request
+  if (checkpoint === null) return state
+  for (const message of messages) {
+    const source = message.source as UserMessage['source'] & { dshRetry?: unknown }
+    if (source.kind !== 'user' || typeof source.dshRetry !== 'object' || source.dshRetry === null) continue
+    const retry = source.dshRetry as { startSeq?: unknown; endSeq?: unknown }
+    if (retry.startSeq === checkpoint.startSeq
+      && typeof retry.endSeq === 'number' && Number.isSafeInteger(retry.endSeq)
+      && retry.endSeq >= checkpoint.startSeq) {
+      return { ...checkpoint.before, lastTurnInjectionTime: null }
+    }
+  }
+  return state
+}
 
 /** The agent registry that owns pre-step processing. */
 export const inject = ['agents', 'sessionProjections']
@@ -58,12 +100,15 @@ export interface Config {
   timeZone?: string
   /** Minimum milliseconds between durable injections in one session. Defaults to 600000 (10 minutes); 0 injects at every eligible step. */
   refreshIntervalMs?: number
+  /** Also refresh after this many user messages; 0 (the default) disables the count threshold. */
+  refreshUserMessageCount?: number
 }
 
 /** Schemastery validation for {@link Config}. */
 export const Config: z<Config> = z.object({
   timeZone: z.string(),
   refreshIntervalMs: z.number(),
+  refreshUserMessageCount: z.number(),
 })
 
 /** Format a non-negative elapsed millisecond count as compact whole-second units. */
@@ -133,6 +178,10 @@ export function apply(ctx: Context, config: Config): void {
   const timeZone = config.timeZone
   const refreshIntervalMs = config.refreshIntervalMs ?? 600_000
   validateRefreshInterval(refreshIntervalMs)
+  const refreshUserMessageCount = config.refreshUserMessageCount ?? 0
+  if (!Number.isSafeInteger(refreshUserMessageCount) || refreshUserMessageCount < 0) {
+    throw new TypeError('time-context: refreshUserMessageCount must be a non-negative safe integer')
+  }
   let fallbackFormatter: Intl.DateTimeFormat
   try {
     fallbackFormatter = createTimestampFormatter(timeZone)
@@ -156,23 +205,46 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.sessionProjections.register({
     key: 'timeContext',
-    stateVersion: 2,
+    stateVersion: 5,
     stateSchema: timeContextStateSchema,
-    init: () => ({ lastMessageTime: null, lastInjectionTime: null, lastTurnInjectionTime: null }),
+    init: () => ({ lastMessageTime: null, lastInjectionTime: null, lastInjectionSeq: null, lastTurnInjectionTime: null, userMessagesSinceInjection: 0,
+      openTurn: null, request: null }),
     apply: (state, event) => {
       if (event.type === 'turn/start' || event.type === 'turn/end') {
-        return state.lastTurnInjectionTime === null ? state : { ...state, lastTurnInjectionTime: null }
+        const openTurn = event.type === 'turn/start' ? event.data.turn : null
+        return state.lastTurnInjectionTime === null && state.openTurn === openTurn
+          ? state : { ...state, openTurn, lastTurnInjectionTime: null }
       }
+      if (event.type === 'developer/message') {
+        const source: { kind: string; form?: unknown } = event.data.message.source
+        if (source.kind === 'plugin:dsh-retry' && source.form === 'reset'
+          && state.request !== null && event.sourceEventSeqs?.includes(SessionSeq(state.request.startSeq))) {
+          // The original turn remains in the durable log, but no longer
+          // contributes either elapsed time or the user-message threshold.
+          return { ...state, ...state.request.before, lastTurnInjectionTime: null, request: null }
+        }
+        return state
+      }
+      // Rewriting historical context is not new conversational activity.
+      // In particular, recall expiry must not shorten the user's idle gap.
+      if (event.surfaceOp !== 'append') return state
       if (event.type === 'user/message') {
-        const injected = event.data.source.kind === name
+        const injected = event.surfaceOp === 'append' && event.data.source.kind === name
+        const directUser = event.surfaceOp === 'append' && event.data.source.kind === 'user'
+        const request = directUser && (state.request === null || state.request.turn !== state.openTurn)
+          ? { startSeq: event.seq, turn: state.openTurn, before: clockState(state) } : state.request
         const withMessage = state.lastMessageTime === event.time
           ? state
           : { ...state, lastMessageTime: event.time }
-        if (!injected) return withMessage
+        if (!injected) return directUser
+          ? { ...withMessage, request, userMessagesSinceInjection: Math.min(Number.MAX_SAFE_INTEGER, state.userMessagesSinceInjection + 1) }
+          : withMessage
         return {
           ...withMessage,
           lastInjectionTime: event.time,
+          lastInjectionSeq: event.seq,
           lastTurnInjectionTime: event.time,
+          userMessagesSinceInjection: 0,
         }
       }
       if (event.type === 'assistant/message' || event.type === 'tool/result') {
@@ -189,10 +261,20 @@ export function apply(ctx: Context, config: Config): void {
     const decision = await next()
     if (decision.kind === 'reject' || signal.aborted) return decision
     const now = Date.now()
-    const state = ctx.sessionProjections.stateOf(agent.session, 'timeContext') as TimeContextProjection
-    if (refreshIntervalMs > 0) {
+    const stored = ctx.sessionProjections.stateOf(agent.session, 'timeContext') as TimeContextProjection
+    // Retry commits its surface replacement during agent/request, after this
+    // hook. Preview the same rollback now; rejected preparation changes no state.
+    const state = requestClock(stored, decision.messages)
+    // Incoming messages are committed only after pre-step returns. Include them
+    // without mutating the projection; a rejected request must not consume them.
+    const userMessageCount = state.userMessagesSinceInjection
+      + decision.messages.filter(message => message.source.kind === 'user').length
+    const countDue = refreshUserMessageCount > 0 && userMessageCount >= refreshUserMessageCount
+    if (refreshIntervalMs > 0 && !countDue) {
       const lastInjection = state.lastInjectionTime
       if (lastInjection != null
+        && state.lastInjectionSeq !== null
+        && agent.session.surface.nodes.includes(SessionSeq(state.lastInjectionSeq))
         && now >= lastInjection
         && now - lastInjection < refreshIntervalMs) return decision
     }
