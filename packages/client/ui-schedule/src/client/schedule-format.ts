@@ -15,6 +15,7 @@ export type FrequencyKey =
   | 'time.utcPrefix'
   | 'frequency.once'
   | 'frequency.every'
+  | 'frequency.idle'
   | 'frequency.daily'
   | 'frequency.dailyLocal'
   | 'frequency.weekly'
@@ -224,6 +225,7 @@ export function zoneChoices(stored: string, system: string, at = Date.now()): re
  */
 export function recordTimeZone(record: ScheduleRecord): string | undefined {
   switch (record.kind) {
+    case 'idle': return record.activeWindow?.time_zone
     case 'after':
     case 'at':
     case 'every': return undefined
@@ -282,15 +284,17 @@ export function formatScheduleFrequency(
         ? t('frequency.weeklyLocal', params)
         : t('frequency.weekly', { ...params, timeZone: zone.label(record.timeZone) })
     }
+    case 'idle':
     case 'every': {
+      const seconds = record.kind === 'idle' ? record.idleSeconds : record.everySeconds
       let selected: { unit: TimeUnit; seconds: number } = SECOND_UNIT
       for (const candidate of UNIT_SECONDS) {
-        if (record.everySeconds % candidate.seconds !== 0) continue
+        if (seconds % candidate.seconds !== 0) continue
         selected = candidate
         break
       }
-      const value = record.everySeconds / selected.seconds
-      return t('frequency.every', { value, unit: unitLabel(selected.unit, value, t) })
+      const value = seconds / selected.seconds
+      return t(record.kind === 'idle' ? 'frequency.idle' : 'frequency.every', { value, unit: unitLabel(selected.unit, value, t) })
     }
   }
   /* v8 ignore next -- The Remote decoder validates this closed union. */

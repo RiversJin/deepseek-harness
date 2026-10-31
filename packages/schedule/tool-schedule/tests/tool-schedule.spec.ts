@@ -276,7 +276,7 @@ describe('Schedule model tools', () => {
         })
       expect((await execute(test, 'schedule_create', args)).value).toEqual({
         code: 'invalid_selector',
-        message: 'schedule_create accepts exactly one of after_seconds, at, every_seconds, daily, weekly, or cron.',
+        message: 'schedule_create accepts exactly one of after_seconds, at, every_seconds, daily, weekly, cron, or idle_seconds.',
       })
     }
     expect(await test.service.list({ sessionId: test.agent.session.id })).toEqual([])

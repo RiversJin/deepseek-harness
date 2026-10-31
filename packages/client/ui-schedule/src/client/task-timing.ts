@@ -41,8 +41,12 @@ export function timingSnapshot(record: ScheduleRecord): ScheduleRecord {
     title: record.title,
     prompt: record.prompt,
     scheduledAt: record.scheduledAt,
+    ...(record.activeWindow === undefined ? {} : { activeWindow: { ...record.activeWindow } }),
+    ...(record.notification === undefined ? {} : { notification: record.notification }),
+    ...(record.retain === undefined ? {} : { retain: record.retain }),
   }
   switch (record.kind) {
+    case 'idle': return { ...common, kind: 'idle', idleSeconds: record.idleSeconds, quietSince: record.quietSince }
     case 'at': return { ...common, kind: record.kind }
     case 'after': return { ...common, kind: record.kind, afterSeconds: record.afterSeconds }
     case 'every': return { ...common, kind: record.kind, everySeconds: record.everySeconds }
@@ -143,6 +147,7 @@ export function timingDraft(record: ScheduleRecord): TimingDraft {
         timeZone: zone,
       }
     }
+    case 'idle': return { ...draft, seconds: String(record.idleSeconds) }
     case 'every': return { ...draft, seconds: String(record.everySeconds) }
     case 'daily':
     case 'weekly': return { ...draft, time: record.time, timeZone: record.timeZone }

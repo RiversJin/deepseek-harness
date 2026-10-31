@@ -3,6 +3,8 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import { unsupportedInbox } from '@deepseek-ai/dsh-agent-loop-testkit'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import SessionProjections from '@deepseek-ai/dsh-session-projection'
+import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import type { CreateSessionOptions } from '@deepseek-ai/dsh-session'
 import Storage, { type KvUnit, type KvUnitDescriptor, type StorageBackend } from '@deepseek-ai/dsh-storage'
@@ -68,10 +70,12 @@ export async function harness(options: {
   backend?: StorageBackend
   direct?: true
   config?: Config
+  persistenceRoot?: string
 } = {}) {
   const ctx = new Context()
   options.onContext?.(ctx)
   await ctx.plugin(SessionStore)
+  await ctx.plugin(SessionProjections)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(SystemPrompt, {})
   await ctx.plugin(ToolRuntime)
@@ -91,7 +95,8 @@ export async function harness(options: {
   const flush = vi.fn(async () => {})
   ctx.on('session/flush', flush)
   // This fixture supplies flush behavior above; Schedule does not invoke persistence methods directly.
-  ctx.provide('sessionPersistence', {} as never)
+  if (options.persistenceRoot) await ctx.plugin(JsonlSessionPersistence, { root: options.persistenceRoot, compression: 'none' })
+  else ctx.provide('sessionPersistence', {} as never)
   await options.beforeService?.(ctx, facility)
   let fiber: Context['fiber']
   if (options.direct) {

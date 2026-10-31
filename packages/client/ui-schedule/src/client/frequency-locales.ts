@@ -13,6 +13,7 @@
 /** Simplified Chinese rule and duration copy, key-set source of truth. */
 export const frequencyZh = {
   'time.locale': 'zh-CN',
+  'frequency.idle': '静默 {value} {unit} 后',
   'time.utcPrefix': 'UTC',
   'frequency.daily': '每天 {time}（{timeZone}）',
   'frequency.dailyLocal': '每天 {time}',
@@ -71,6 +72,7 @@ export const frequencyZh = {
 /** English rule and duration copy, key-identical to the Chinese source. */
 export const frequencyEn: Record<keyof typeof frequencyZh, string> = {
   'time.locale': 'en',
+  'frequency.idle': 'After {value} {unit} of quiet',
   'time.utcPrefix': 'UTC',
   'frequency.daily': 'Daily at {time} ({timeZone})',
   'frequency.dailyLocal': 'Daily at {time}',

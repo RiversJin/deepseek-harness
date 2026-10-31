@@ -17,7 +17,7 @@ import {
 } from '@deepseek-ai/dsh-schedule'
 import type {
   AtInput, CronInput, DailyInput, WeeklyInput, InternalScheduleError, ScheduleCreateValue, ScheduleDeleteValue,
-  ScheduleListValue, ScheduleTimingChange, ScheduleToolError, ScheduleUpdateValue,
+  ScheduleListValue, ScheduleTimingChange, ScheduleToolError, ScheduleUpdateValue, ScheduleDeliveryInput,
 } from '@deepseek-ai/dsh-schedule'
 
 /** Plugin name registered with the Loader. */
@@ -28,6 +28,18 @@ export const name = 'tool-schedule'
  * composition keeps that service off. */
 export const inject = ['tools']
 
+// Local patch: delivery options (active window, notification content, retention) and idle tasks.
+const WINDOW_PROPERTIES = {
+  start: { type: 'string', required: true, description: 'Start time in HH:mm:ss.' },
+  end: { type: 'string', required: true, description: 'End time in HH:mm:ss; 24:00:00 means midnight at the end of the day.' },
+  time_zone: { type: 'string', required: true, description: 'IANA time zone for the delivery window.' },
+} as const
+const DELIVERY_PARAMETERS = {
+  active_window: { type: 'object', additionalProperties: false, properties: WINDOW_PROPERTIES, description: 'Daily local-time window for delivery.' },
+  notification: { type: 'string', enum: ['prompt', 'time_passing'], description: "Use prompt to deliver the task's prompt, or time_passing to deliver the current time, quiet duration, time since the last notification, and time since the last human message." },
+  retain: { type: 'string', enum: ['all', 'latest'], description: 'Use all to retain delivered notifications, or latest to retain the latest notification from this task in context.' },
+} as const
+
 const SHARED_VIEW_PROPERTIES = {
   id: { type: 'string', required: true },
   title: { type: 'string', required: true },
@@ -35,6 +47,9 @@ const SHARED_VIEW_PROPERTIES = {
   scheduledAt: { type: 'string', required: true },
   state: { type: 'string', required: true, enum: ['scheduled', 'overdue'] },
   deliveryMode: { type: 'string', required: true, const: 'host' },
+  activeWindow: DELIVERY_PARAMETERS.active_window,
+  notification: DELIVERY_PARAMETERS.notification,
+  retain: DELIVERY_PARAMETERS.retain,
 } as const
 
 const AFTER_VIEW_SCHEMA = {
@@ -100,9 +115,15 @@ const CRON_VIEW_SCHEMA = {
   },
 } as const
 
+const IDLE_VIEW_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: { ...SHARED_VIEW_PROPERTIES, kind: { type: 'string', required: true, const: 'idle' },
+    idleSeconds: { type: 'number', required: true }, quietSince: { type: 'string', required: true } },
+} as const
+
 const VIEW_SCHEMA = {
   oneOf: [
-    AFTER_VIEW_SCHEMA, AT_VIEW_SCHEMA, EVERY_VIEW_SCHEMA, DAILY_VIEW_SCHEMA, WEEKLY_VIEW_SCHEMA, CRON_VIEW_SCHEMA,
+    AFTER_VIEW_SCHEMA, AT_VIEW_SCHEMA, EVERY_VIEW_SCHEMA, DAILY_VIEW_SCHEMA, WEEKLY_VIEW_SCHEMA, CRON_VIEW_SCHEMA, IDLE_VIEW_SCHEMA,
   ],
 } as const
 
@@ -180,11 +201,13 @@ const UPDATE_OUTPUT_SCHEMA = {
   ],
 } as const
 
+const DELIVERY_DESCRIPTION = ' Use active_window to choose delivery hours, notification to choose the notification content, and retain to choose how delivered notifications remain in context.'
+
 const CREATE_DESCRIPTION =
   'Create a reminder in the current session that delivers prompt when it becomes due. '
-  + 'Supply exactly one timing parameter: after_seconds, at, every_seconds, daily, weekly, or cron. '
+  + 'Supply exactly one timing parameter: after_seconds, at, every_seconds, daily, weekly, cron, or idle_seconds. '
   + 'Local times that do not exist in the zone are skipped; repeated local times fire once, at the earlier instant. '
-  + 'After downtime, a recurring reminder delivers only its latest missed occurrence. Delivery can repeat after a crash.'
+  + 'After downtime, a recurring reminder delivers only its latest missed occurrence. Delivery can repeat after a crash.' + DELIVERY_DESCRIPTION
 
 const LIST_DESCRIPTION = 'List the active reminders in the current session.'
 
@@ -193,7 +216,7 @@ const DELETE_DESCRIPTION =
 
 const UPDATE_DESCRIPTION =
   'Change a reminder in place, keeping its id. Supply a new title, prompt, or at most one timing parameter; '
-  + 'omitted fields keep their stored values. To change a relative delay, create a new reminder.'
+  + 'omitted fields keep their stored values. To change a relative delay, create a new reminder.' + DELIVERY_DESCRIPTION
 
 const CREATE_TITLE_DESCRIPTION =
   `Concise task name in the user's language, at most ${MAX_TITLE_LENGTH} characters. `
@@ -253,10 +276,11 @@ function invalidInterval(everySeconds: number | undefined): ScheduleToolError | 
 }
 
 /** Validate selector constraints that the open parameter root cannot express. */
-function validateCreateArgs(args: {
+function validateCreateArgs(args: ScheduleDeliveryInput & {
   prompt: string
   title: string
   after_seconds?: number
+  idle_seconds?: number
   at?: AtInput
   every_seconds?: number
   daily?: DailyInput
@@ -271,16 +295,20 @@ function validateCreateArgs(args: {
     && key !== 'every_seconds'
     && key !== 'daily'
     && key !== 'weekly'
-    && key !== 'cron')
+    && key !== 'cron'
+    && key !== 'idle_seconds'
+    && key !== 'active_window'
+    && key !== 'notification'
+    && key !== 'retain')
     || Number(args.after_seconds !== undefined)
     + Number(args.at !== undefined)
     + Number(args.every_seconds !== undefined)
     + Number(args.daily !== undefined)
     + Number(args.weekly !== undefined)
-    + Number(args.cron !== undefined) !== 1) {
+    + Number(args.cron !== undefined) + Number(args.idle_seconds !== undefined) !== 1) {
     return {
       code: 'invalid_selector',
-      message: 'schedule_create accepts exactly one of after_seconds, at, every_seconds, daily, weekly, or cron.',
+      message: 'schedule_create accepts exactly one of after_seconds, at, every_seconds, daily, weekly, cron, or idle_seconds.',
     }
   }
   if (args.prompt.trim().length === 0) {
@@ -300,10 +328,11 @@ function validateCreateArgs(args: {
 }
 
 /** Validate the in-place update's selector count, id, and any supplied name, instruction, or interval. */
-function validateUpdateArgs(args: {
+function validateUpdateArgs(args: ScheduleDeliveryInput & {
   id: string
   title?: string
   prompt?: string
+  idle_seconds?: number
   at?: AtInput
   every_seconds?: number
   daily?: DailyInput
@@ -316,6 +345,7 @@ function validateUpdateArgs(args: {
     args.daily !== undefined,
     args.weekly !== undefined,
     args.cron !== undefined,
+    args.idle_seconds !== undefined,
   ].filter(Boolean).length
   if (Object.keys(args).some(key => key !== 'id'
     && key !== 'title'
@@ -324,20 +354,25 @@ function validateUpdateArgs(args: {
     && key !== 'every_seconds'
     && key !== 'daily'
     && key !== 'weekly'
-    && key !== 'cron')
+    && key !== 'cron'
+    && key !== 'idle_seconds'
+    && key !== 'active_window'
+    && key !== 'notification'
+    && key !== 'retain')
     || selectors > 1) {
     return {
       code: 'invalid_selector',
-      message: 'schedule_update accepts at most one of at, every_seconds, daily, weekly, or cron.',
+      message: 'schedule_update accepts at most one of at, every_seconds, daily, weekly, cron, or idle_seconds.',
     }
   }
   if (args.id.length === 0 || args.id.trim() !== args.id) {
     return { code: 'invalid_rule', message: 'schedule_update id must be non-empty without surrounding whitespace.' }
   }
-  if (selectors === 0 && args.title === undefined && args.prompt === undefined) {
+  if (selectors === 0 && args.title === undefined && args.prompt === undefined
+    && args.active_window === undefined && args.notification === undefined && args.retain === undefined) {
     return {
       code: 'invalid_selector',
-      message: 'schedule_update needs a new title, prompt, or one of at, every_seconds, daily, weekly, or cron.',
+      message: 'schedule_update needs a new title, prompt, or one of at, every_seconds, daily, weekly, cron, or idle_seconds.',
     }
   }
   if (args.title !== undefined && args.title.trim().length === 0) {
@@ -354,6 +389,7 @@ function validateUpdateArgs(args: {
 
 /** The one timing replacement the update carries, or undefined when the request keeps the committed target. */
 function timingChangeFrom(args: {
+  idle_seconds?: number
   at?: AtInput
   every_seconds?: number
   daily?: DailyInput
@@ -365,6 +401,7 @@ function timingChangeFrom(args: {
   if (args.daily !== undefined) return { kind: 'daily', daily: args.daily }
   if (args.weekly !== undefined) return { kind: 'weekly', weekly: args.weekly }
   if (args.cron !== undefined) return { kind: 'cron', cron: args.cron }
+  if (args.idle_seconds !== undefined) return { kind: 'idle', idle_seconds: args.idle_seconds }
   return undefined
 }
 
@@ -373,6 +410,7 @@ function timingChangeFrom(args: {
  * generated tool catalog states them.
  */
 const SELECTOR_PARAMETERS = {
+  idle_seconds: { type: 'number', description: 'Quiet interval in seconds. The interval starts again when each round of activity ends.' },
   every_seconds: {
     type: 'number',
     description: `Fixed-rate interval in whole seconds, at least ${MIN_EVERY_INTERVAL_SECONDS}, aligned to the creation time; changing it with schedule_update re-aligns it to the save time.`,
@@ -469,6 +507,7 @@ function registerScheduleTools(ctx: Context): void {
         description: 'Delay in whole seconds.',
       },
       ...SELECTOR_PARAMETERS,
+      ...DELIVERY_PARAMETERS,
     },
     output: { schema: CREATE_OUTPUT_SCHEMA, render: renderValue },
     async execute(args, exec): Promise<ScheduleCreateValue> {
@@ -549,6 +588,7 @@ function registerScheduleTools(ctx: Context): void {
         description: 'New reminder content.',
       },
       ...SELECTOR_PARAMETERS,
+      ...DELIVERY_PARAMETERS,
     },
     output: { schema: UPDATE_OUTPUT_SCHEMA, render: renderValue },
     async execute(args, exec): Promise<ScheduleUpdateValue> {
@@ -579,6 +619,9 @@ function registerScheduleTools(ctx: Context): void {
           ...(change === undefined ? {} : { change }),
           ...(args.title === undefined ? {} : { title: args.title }),
           ...(args.prompt === undefined ? {} : { prompt: args.prompt }),
+          ...(args.active_window === undefined ? {} : { active_window: args.active_window }),
+          ...(args.notification === undefined ? {} : { notification: args.notification }),
+          ...(args.retain === undefined ? {} : { retain: args.retain }),
         }, exec.signal)
         return 'record' in result ? scheduleView(result.record, Date.now()) : result
       } catch (error: unknown) {

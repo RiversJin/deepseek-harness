@@ -4,6 +4,8 @@
 
 Schedule 独立于 Session 的加载状态存储提醒，并将其投递到原 Session。本页记录 [`types.ts`](../../packages/schedule/schedule/src/types.ts) 中的持久与模型可见类型；[包 README](../../packages/schedule/schedule/README.zh.md) 负责组合方式与提醒文本格式。
 
+静默规则向 Host 任务联合类型添加 `IdleScheduleRecord`。投递时段、通知内容和保留方式是创建与比较更新共同使用的独立可选字段。历史 `schedule/change` 联合类型保留已有分支。静默投递、回放与回退语义见 [Schedule 包](../../packages/schedule/schedule/README.zh.md#use-this-package)。
+
 ## 持久记录
 
 `ScheduleId` 是全局唯一的[品牌化 ID](core.zh.md#branded-ids)。版本 1 的 `schedule` storage domain 的 `tasks` 表将每条 `ScheduleRecord` 与原始 `sessionId` 绑定，并存储 `status: 'active' | 'inactive'` 和可选的 `lastDelivery`。缺少状态的记录规范化为 `active`，不扫描或重建历史 Session。创建时将目标规范化为 RFC 3339 UTC `scheduledAt`；`after` 保留提交的延迟，`every` 保留固定间隔，`daily` 与 `weekly` 保留规范化后的本地 `time` 及显式 `timeZone`，`cron` 保留规范化后的五字段 `expression` 及显式 `timeZone`。每日、每周与 cron 记录解码保留已提交时点及已存储的时区拼写。已存储的任务记录声明必填的 `title`，即任务界面显示的短名称；创建时必须提供该字段，且绝不从指令派生。任何已存储记录都不得缺少标题：`title` 缺失、去除首尾空白后为空、带首尾空白或超过 120 个字符的已存储记录都会以 `ScheduleLogError` 拒绝持久化解码；schedule domain 未声明备份并跳过的策略，因此一条这样的已存储任务会拒绝整个 domain 的打开，而不是被丢弃。仅显式删除会移除任务；此前已物理删除的任务不会被恢复或虚构。
