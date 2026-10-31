@@ -1,6 +1,7 @@
 /** Pure timing edits accept every recurrence kind, compute creation targets, and preserve targets for normalized no-ops. */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as domain from '../src/domain.ts'
+import { createIdleScheduleRecord } from '../src/idle.ts'
 import { resolveScheduleUpdate, retainedTitle } from '../src/update.ts'
 import type { ScheduleRecord, ScheduleTimingChange, ScheduleToolError, ScheduleUpdateContent } from '../src/types.ts'
 
@@ -42,6 +43,7 @@ function createdFrom(change: ScheduleTimingChange): ScheduleRecord {
     case 'daily': return domain.createDailyScheduleRecord(id, prompt, change.daily, now, storedTitle)
     case 'weekly': return domain.createWeeklyScheduleRecord(id, prompt, change.weekly, now, storedTitle)
     case 'cron': return domain.createCronScheduleRecord(id, prompt, change.cron, now, storedTitle)
+    case 'idle': return createIdleScheduleRecord(id, prompt, change.idle_seconds, now, storedTitle)
   }
 }
 

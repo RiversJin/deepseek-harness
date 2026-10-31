@@ -134,7 +134,8 @@ class ReleasedV3ToV4Stage implements SessionFormatMigrationStage {
       return
     }
     if (event.type !== 'agent/inbox/spliced' || !isSessionFormatJsonObject(event.data)) return
-    const { target, start, removedCount = 0, inserted } = event.data
+    // Fixtures and early V3 logs omit `start`; an absent start is a splice at the queue head.
+    const { target, start = 0, removedCount = 0, inserted } = event.data
     if (target !== 'next-turn' && target !== 'next-step') throw new SessionFormatError('invalid legacy inbox target')
     const offset = sessionFormatCount(start, 'legacy inbox start')
     const removed = sessionFormatCount(removedCount, 'legacy inbox removedCount')

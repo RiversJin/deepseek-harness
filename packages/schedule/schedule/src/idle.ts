@@ -23,8 +23,13 @@ const optionsSchema = z.object({
 export function decodeDeliveryOptions(value: unknown): ScheduleDeliveryOptions {
   const result = optionsSchema.safeParse(value)
   if (!result.success) throw new ScheduleLogError('Invalid schedule delivery options')
-  if (result.data.activeWindow) canonicalizeTimeZone(result.data.activeWindow.time_zone)
-  return result.data
+  const { activeWindow, notification, retain } = result.data
+  if (activeWindow) canonicalizeTimeZone(activeWindow.time_zone)
+  return {
+    ...(activeWindow === undefined ? {} : { activeWindow }),
+    ...(notification === undefined ? {} : { notification }),
+    ...(retain === undefined ? {} : { retain }),
+  }
 }
 
 /** Merge explicitly supplied delivery choices with a stored task.
