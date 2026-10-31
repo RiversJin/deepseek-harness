@@ -1,0 +1,11 @@
+{
+  "extends": "../../../.artifacts/tsconfig.schedule.json",
+  "compilerOptions": {
+    "composite": true,
+    "paths": {
+      "@deepseek-ai/dsh-typert-protocol": [
+        "../../typert/protocol/src/index.ts"
+      ]
+    }
+  }
+}

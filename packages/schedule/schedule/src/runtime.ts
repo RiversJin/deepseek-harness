@@ -3,15 +3,20 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
-    'schedule': { kind: 'schedule' } & ContextFormed
+    'schedule': { kind: 'schedule'; taskId?: string; notification?: 'prompt' | 'time_passing'; retain?: 'all' | 'latest'; issuedAt?: number; quietSince?: number; scheduledAt?: string } & ContextFormed
   }
 }
 import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import { isRecurringScheduleRecord, renderReminderFraming, renderRecurringReminderBatchFraming, resolveRecurringOccurrence } from './domain.ts'
 import type { DeliveryRetentionBounds, RecurringScheduleRecord } from './types.ts'
 import type { ScheduleTask } from './storage.ts'
 import { appendDelivery } from './delivery-history.ts'
+import { afterActivity, nextInWindow } from './idle.ts'
+import { timeNotification } from './notification.ts'
+import type {} from './activity.ts'
+import { MessageId } from '@deepseek-ai/dsh-llm/brand'
 
 /** Largest delay Node timers represent without clamping. */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
@@ -22,6 +27,9 @@ export class ScheduleRuntime {
   private running: Promise<void> | undefined
   private stopping = false
   private requested = false
+  private readonly activityEnds = new Map<string, number>()
+  private readonly waiting = new Set<string>()
+  private readonly disposeListeners: Array<() => void> = []
 
   /**
    * @param ctx - Host services used to resume and enqueue.
@@ -35,7 +43,19 @@ export class ScheduleRuntime {
     private readonly transact: (work: () => Promise<void>) => Promise<void>,
     private readonly commit: (task: ScheduleTask) => Promise<void>,
     private readonly retention: DeliveryRetentionBounds,
-  ) {}
+  ) {
+    this.disposeListeners.push(ctx.on('session/event', (session, event) => {
+      if (event.type !== 'turn/end' && event.type !== 'turn/start') return
+      if (!this.tasks().some(task => task.sessionId === session.id && task.status === 'active' && task.record.kind === 'idle')) return
+      if (event.type === 'turn/end') this.activityEnds.set(session.id, event.time)
+      this.requestDrive()
+    }, { global: true }))
+    this.disposeListeners.push(ctx.on('agent/status', ({ agent, status }) => {
+      if (!this.tasks().some(task => task.sessionId === agent.session.id && task.status === 'active' && task.record.kind === 'idle')) return
+      if (status === 'running') this.waitForActivity(agent)
+      this.requestDrive()
+    }))
+  }
 
   /**
    * Recompute the nearest obligation after startup or a durable change.
@@ -72,6 +92,7 @@ export class ScheduleRuntime {
   /** Stop the timer and drain an accepted delivery before storage closes. */
   async dispose(): Promise<void> {
     this.stopping = true
+    for (const dispose of this.disposeListeners) dispose()
     this.clearTimer()
     // requestDrive reports execution failures; teardown only waits for quiescence.
     await this.running?.catch(() => undefined)
@@ -82,17 +103,111 @@ export class ScheduleRuntime {
     this.timer = undefined
   }
 
+  private waitForActivity(agent: Agent): void {
+    const id = agent.session.id
+    if (this.waiting.has(id)) return
+    this.waiting.add(id)
+    void agent.whenIdle().then(() => {
+      if (this.stopping) return
+      this.activityEnds.set(id, Date.now())
+      this.waiting.delete(id)
+      this.requestDrive()
+    }).catch((error: unknown) => {
+      this.waiting.delete(id)
+      if (!this.stopping) this.ctx.logger.warn(`schedule: activity observation failed: ${String(error)}`)
+    })
+  }
+
+  private target(task: ScheduleTask, now: number): number {
+    if (task.record.kind === 'idle' && this.waiting.has(task.sessionId)) return Infinity
+    return nextInWindow(Math.max(Date.parse(task.record.scheduledAt), now), task.record.activeWindow)
+  }
+
+  private async deliverIndividual(task: ScheduleTask, agent: Agent): Promise<void> {
+    const idle = task.record.kind === 'idle'
+    if (idle && agent.status === 'running') { this.waitForActivity(agent); return }
+    const publish = async (signal: AbortSignal): Promise<void> => {
+      if (this.stopping || signal.aborted) return
+      const activity = this.ctx.sessionProjections.stateOf(agent.session, 'scheduleActivity')!
+      const latest = activity.receipts[task.record.id]
+      let record = task.record
+      if (record.kind === 'idle' && activity.lastEnd !== null && activity.lastEnd > Date.parse(record.quietSince)) {
+        record = afterActivity(record, activity.lastEnd)
+      }
+      const recovered = latest && latest.messageId !== task.lastDelivery?.messageId ? latest : undefined
+      const now = recovered?.issuedAt ?? Date.now()
+      if (!recovered && this.target({ ...task, record }, now) > now) {
+        if (record !== task.record) await this.commit({ ...task, record })
+        return
+      }
+      if (idle && !recovered && agent.inbox.nextTurn.length > 0) {
+        this.waitForActivity(agent)
+        return
+      }
+      const previous = task.lastDelivery === undefined ? undefined : Date.parse(task.lastDelivery.deliveredAt)
+      const quietSince = record.kind === 'idle' ? Date.parse(record.quietSince) : activity.lastEnd ?? now
+      const text = recovered ? recovered.text
+        : record.notification === 'time_passing'
+          ? timeNotification(now, quietSince, previous, activity.lastHuman ?? undefined, record.activeWindow?.time_zone ?? 'UTC')
+          : record.prompt
+      const message = createUserMessage({ content: [{ type: 'text', text }], source: {
+        kind: 'schedule', taskId: record.id, notification: record.notification ?? 'prompt', retain: record.retain ?? 'all',
+        issuedAt: now, quietSince, scheduledAt: record.scheduledAt,
+      } })
+      signal.throwIfAborted()
+      if (!recovered) agent.followup(message)
+      if (!await this.ctx.sessions.flush(agent.session)) throw new Error('Session persistence did not acknowledge the reminder')
+      const occurrence = isRecurringScheduleRecord(record) ? resolveRecurringOccurrence(record, now) : undefined
+      const next = record.kind === 'idle' ? afterActivity(record, Math.max(now, activity.lastEnd ?? 0))
+        : occurrence ? { ...record, scheduledAt: occurrence.nextScheduledAt ?? occurrence.occurrenceAt } : record
+      await this.commit({ ...task, record: next,
+        status: record.kind === 'idle' || occurrence?.nextScheduledAt !== undefined ? 'active' : 'inactive',
+        ...appendDelivery({ ...task, record: { ...record, prompt: text } }, {
+          scheduledAt: recovered?.scheduledAt ?? occurrence?.occurrenceAt ?? record.scheduledAt, deliveredAt: new Date(now).toISOString(), messageId: recovered ? MessageId(recovered.messageId) : message.id,
+        }, this.retention) })
+      if (recovered) this.requestDrive()
+    }
+    if (!idle) { await publish(new AbortController().signal); return }
+    let work: Promise<void>
+    try { work = agent.runMaintenance(publish) }
+    catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('already has active work')) throw error
+      this.waitForActivity(agent)
+      return
+    }
+    await work
+  }
+
   private async drive(): Promise<void> {
     this.clearTimer()
     const failed = new Set<string>()
     const handled = new Set<string>()
     const scanNow = Date.now()
-    const due = this.tasks().filter(task => task.status === 'active' && Date.parse(task.record.scheduledAt) <= scanNow)
+    for (const task of this.tasks()) {
+      const endedAt = this.activityEnds.get(task.sessionId)
+      if (task.status === 'active' && task.record.kind === 'idle' && endedAt !== undefined && endedAt > Date.parse(task.record.quietSince)) {
+        await this.commit({ ...task, record: afterActivity(task.record, endedAt) })
+      }
+    }
+    const due = this.tasks().filter(task => task.status === 'active' && this.target(task, scanNow) <= scanNow)
     for (const task of due) {
       if (this.stopping) return
       if (handled.has(task.record.id)) continue
+      if (task.record.kind === 'idle' || task.record.notification !== undefined || task.record.retain !== undefined) {
+        handled.add(task.record.id)
+        try {
+          const resolved = await this.ctx.sessionController.resolveAgent(task.sessionId)
+          if ('error' in resolved) throw resolved.error
+          if (!this.stopping) await this.deliverIndividual(task, resolved.agent)
+        } catch (error) {
+          failed.add(task.record.id)
+          this.ctx.logger.warn(`schedule: reminder ${task.record.id} was not acknowledged: ${String(error)}`)
+        }
+        continue
+      }
       const group = isRecurringScheduleRecord(task.record)
-        ? due.filter(candidate => candidate.sessionId === task.sessionId && isRecurringScheduleRecord(candidate.record))
+        ? due.filter(candidate => candidate.sessionId === task.sessionId && isRecurringScheduleRecord(candidate.record)
+          && candidate.record.notification === undefined && candidate.record.retain === undefined)
         : [task]
       for (const member of group) handled.add(member.record.id)
       let admitted = group
@@ -104,7 +219,7 @@ export class ScheduleRuntime {
         if (this.stopping) return
         const now = Date.now()
         // Session restoration can span a wall-clock rollback; future members keep their timer obligation.
-        admitted = group.filter(member => Date.parse(member.record.scheduledAt) <= now)
+        admitted = group.filter(member => this.target(member, now) <= now)
         if (admitted.length === 0) continue
         const recurring = admitted.filter((member): member is ScheduleTask & { record: RecurringScheduleRecord } =>
           isRecurringScheduleRecord(member.record))
@@ -154,10 +269,10 @@ export class ScheduleRuntime {
     if (this.stopping) return
     const next = this.tasks().filter(task => task.status === 'active' && !failed.has(task.record.id))
       .reduce<number | undefined>((at, task) => {
-        const target = Date.parse(task.record.scheduledAt)
+      const target = this.target(task, Date.now())
         return at === undefined ? target : Math.min(at, target)
       }, undefined)
-    if (next !== undefined) {
+    if (next !== undefined && Number.isFinite(next)) {
       this.timer = setTimeout(() => { this.timer = undefined; this.requestDrive() },
         Math.max(0, Math.min(next - Date.now(), MAX_TIMER_DELAY_MS)))
       this.timer.unref()

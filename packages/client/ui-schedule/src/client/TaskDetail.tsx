@@ -43,11 +43,11 @@ type RuleTranslate = PropsLocale<'schedule.manager'>['t']
 
 /** Recurrence choices the Run time card's Repeat row offers, in mock menu order. */
 const RULE_CHOICES = [
-  'weekly', 'weekdays', 'daily', 'every-hour', 'every-minute', 'every-second', 'once', 'cron',
+  'idle', 'weekly', 'weekdays', 'daily', 'every-hour', 'every-minute', 'every-second', 'once', 'cron',
 ] as const
 
 /** One recurrence choice a retained task can be switched to. */
-type RuleKind = 'daily' | 'weekdays' | 'weekly' | 'every' | 'once' | 'cron'
+type RuleKind = 'idle' | 'daily' | 'weekdays' | 'weekly' | 'every' | 'once' | 'cron'
 
 /** One visible Repeat-menu option; interval units are separate user intents. */
 type RuleChoice = (typeof RULE_CHOICES)[number]
@@ -57,13 +57,13 @@ type IntervalChoice = Extract<RuleChoice, `every-${string}`>
 
 /** Repeat menu label of each recurrence choice. */
 const RULE_KIND_LABELS: Record<RuleKind, TaskManagerKey> = {
-  daily: 'rule.daily', weekdays: 'rule.weekdays', weekly: 'rule.weekly',
+  idle: 'rule.idle', daily: 'rule.daily', weekdays: 'rule.weekdays', weekly: 'rule.weekly',
   every: 'rule.everyMinutes', once: 'rule.once', cron: 'rule.cron',
 }
 
 /** Repeat-menu label of each visible choice. */
 const RULE_CHOICE_LABELS: Record<RuleChoice, TaskManagerKey> = {
-  daily: 'rule.daily', weekdays: 'rule.weekdays', weekly: 'rule.weekly',
+  idle: 'rule.idle', daily: 'rule.daily', weekdays: 'rule.weekdays', weekly: 'rule.weekly',
   'every-minute': 'rule.everyMinutes', 'every-hour': 'rule.everyHours', 'every-second': 'rule.everySeconds',
   once: 'rule.once', cron: 'rule.cron',
 }
@@ -89,7 +89,7 @@ const INTERVAL_ERROR_KEYS: Record<IntervalUnit, TaskManagerKey> = {
 
 /** Messages `draftError` can return; each clears as soon as edits fix the draft. */
 const LOCAL_FAILURES: ReadonlySet<TaskManagerKey> = new Set<TaskManagerKey>([
-  'rule.invalidTitle', 'rule.invalidPrompt', 'timing.invalidInterval', 'rule.cronInvalid', 'timing.invalid',
+  'rule.invalidTitle', 'rule.invalidPrompt', 'timing.invalidInterval', 'timing.invalidIdle', 'rule.cronInvalid', 'timing.invalid',
 ])
 
 /** Elapsed interval a rule receives when it starts repeating without a stored interval. */
@@ -109,7 +109,7 @@ const MIN_INTERVAL_SECONDS = 60
 
 /** Exhaustive recurrence-choice labels of the stored rule records. */
 const RULE_KIND_BY_RECORD: Record<ScheduleRecord['kind'], RuleKind> = {
-  at: 'once', after: 'once', every: 'every', daily: 'daily', weekly: 'weekly', cron: 'cron',
+  idle: 'idle', at: 'once', after: 'once', every: 'every', daily: 'daily', weekly: 'weekly', cron: 'cron',
 }
 
 /** ISO weekdays of the weekly choice in display order, Monday through Sunday. */
@@ -321,7 +321,7 @@ export function TaskDetail({
   useEffect(() => {
     if (previousKind.current === edit.shown.kind) return
     previousKind.current = edit.shown.kind
-    if (edit.shown.kind !== 'every') {
+    if (edit.shown.kind !== 'every' && edit.shown.kind !== 'idle') {
       // Leaving the interval drops the explicit choice with the row that held it.
       explicitUnit.current = false
       return
@@ -928,6 +928,7 @@ function seedDraft(record: ScheduleCatalogEntry, kind: RuleKind): TimingDraft {
         timeZone: zone, seconds: '', expression: '',
       }
     }
+    case 'idle':
     case 'every':
       return { date: '', time: '', timeZone: '', seconds: String(RULE_DEFAULT_EVERY_SECONDS), expression: '' }
     case 'daily':
@@ -1017,6 +1018,7 @@ function ruleChange(
       kind: 'at',
       at: { date: draft.date, time: withSeconds(draft.time), time_zone: draft.timeZone.trim() },
     }
+    case 'idle': return { kind: 'idle', idle_seconds: Number(draft.seconds) }
     case 'every': return { kind: 'every', every_seconds: Number(draft.seconds) }
     case 'daily': return {
       kind: 'daily',
@@ -1068,6 +1070,10 @@ function draftError(shown: RuleShown): TaskManagerKey | undefined {
   const title = shown.title.trim()
   if (title.length === 0 || title.length > RULE_TITLE_MAX_LENGTH) return 'rule.invalidTitle'
   if (shown.prompt.trim().length === 0) return 'rule.invalidPrompt'
+  if (shown.kind === 'idle') {
+    const ms = Number(shown.draft.seconds) * 1000
+    return Number.isSafeInteger(ms) && ms > 0 ? undefined : 'timing.invalidIdle'
+  }
   if (shown.kind === 'every') {
     return /^\d+$/.test(shown.draft.seconds) && Number(shown.draft.seconds) >= MIN_INTERVAL_SECONDS
       ? undefined
@@ -1472,7 +1478,7 @@ function RuleCard({
   }
   // The interval stepper's arrows move the staged quantity by one whole unit of
   // the row's own unit and never below the Host's floor in that unit.
-  const intervalMin = Math.ceil(MIN_INTERVAL_SECONDS / INTERVAL_UNIT_SECONDS[intervalUnit])
+  const intervalMin = shown.kind === 'idle' ? 0.001 / INTERVAL_UNIT_SECONDS[intervalUnit] : Math.ceil(MIN_INTERVAL_SECONDS / INTERVAL_UNIT_SECONDS[intervalUnit])
   const intervalValue = shown.draft.seconds === '' ? undefined : Number(shown.draft.seconds) / INTERVAL_UNIT_SECONDS[intervalUnit]
   const stepInterval = (delta: 1 | -1): void => {
     const next = intervalValue === undefined ? intervalMin : Math.max(intervalMin, intervalValue + delta)
@@ -1592,7 +1598,7 @@ function RuleCard({
         rowId={rowId}
         onToggle={onToggleWeekday}
       />}
-      {shown.kind === 'every' ? <div className={css.ruleRow}>
+      {(shown.kind === 'every' || shown.kind === 'idle') ? <div className={css.ruleRow}>
         {/* The label names the row and stays the input's accessible name; the
             unit rides beside the number instead of inside the label, so the
             same quantity never reads as hours in one state and seconds in
@@ -1796,14 +1802,14 @@ function RuleCard({
     {/* One hint slot under the rows: a refused save's message replaces the
         descriptive copy there, and the description returns once edits remove
         the cause or Cancel restores the stored rule. */}
-    {shown.kind === 'every' && <p
+    {(shown.kind === 'every' || shown.kind === 'idle') && <p
       id={rowId('interval-hint')}
       role={failure === undefined ? undefined : 'alert'}
       className={clsx(css.ruleHint, failure !== undefined && css.ruleHintError)}
     >
-      {t(failure ?? INTERVAL_HINT_KEYS[intervalUnit])}
+      {t(failure ?? (shown.kind === 'idle' ? 'timing.idleHint' : INTERVAL_HINT_KEYS[intervalUnit]))}
     </p>}
-    {shown.kind !== 'every' && <>
+    {shown.kind !== 'every' && shown.kind !== 'idle' && <>
       {/* The cron choice shows no clock row, so its own sentence takes that
           row's hint slot; a clock-time choice shows one only when its rule
           stored no zone to read. */}

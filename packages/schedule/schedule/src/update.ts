@@ -1,5 +1,6 @@
 /** Optimistic name, instruction, and timing updates of retained Host tasks, without Session mutations. */
 import { isDeepStrictEqual } from 'node:util'
+import { afterActivity, createIdleScheduleRecord, deliveryOptions } from './idle.ts'
 import {
   canonicalizeCronExpression, canonicalizeTimeZone, createAtScheduleRecord, createCronScheduleRecord,
   createDailyScheduleRecord, createEveryScheduleRecord, createWeeklyScheduleRecord, decodeScheduleRecord,
@@ -11,6 +12,7 @@ import type { ScheduleRecord, ScheduleTimingChange, ScheduleUpdateContent, Sched
 /** Name the exact selector property each timing kind must carry, or undefined for an unknown discriminant. */
 function timingSelector(kind: string): string | undefined {
   switch (kind) {
+    case 'idle': return 'idle_seconds'
     case 'at': return 'at'
     case 'every': return 'every_seconds'
     case 'daily': return 'daily'
@@ -93,6 +95,11 @@ function changedRecord(
   if (value === undefined) return withContent(current, title, prompt)
   const change = validateChange(value)
   switch (change.kind) {
+    case 'idle': {
+      if (current.kind === 'idle' && current.idleSeconds === change.idle_seconds) return withContent(current, title, prompt)
+      return createIdleScheduleRecord(current.id, prompt, change.idle_seconds,
+        current.kind === 'idle' ? Date.parse(current.quietSince) : now, title)
+    }
     case 'at':
       if ((current.kind === 'after' || current.kind === 'at')
         && parseAtInput(change.at) === Date.parse(current.scheduledAt)) return withContent(current, title, prompt)
@@ -170,8 +177,11 @@ export function resolveScheduleUpdate(
     const retained = retainedTitle(current)
     const title = content.title === undefined ? retained : scheduleTitle(content.title)
     const prompt = content.prompt === undefined ? current.prompt : schedulePrompt(content.prompt)
-    const record = changedRecord(current, title, prompt, change, now)
-    return { id: current.id, updated: record !== current, record }
+    const changed = changedRecord(current, title, prompt, change, now)
+    const options = deliveryOptions(current, content)
+    let record: ScheduleRecord = { ...changed, ...options }
+    if (record.kind === 'idle') record = afterActivity(record, Date.parse(record.quietSince))
+    return { id: current.id, updated: !isDeepStrictEqual(record, current), record: isDeepStrictEqual(record, current) ? current : Object.freeze(record) }
   } catch (error) {
     if (!(error instanceof ScheduleInputError)) throw error
     return { code: error.code, message: error.message }

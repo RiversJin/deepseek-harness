@@ -4,6 +4,7 @@
  */
 
 import { Temporal } from '@js-temporal/polyfill'
+import { createIdleScheduleRecord, decodeDeliveryOptions } from './idle.ts'
 import { SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionLogOffset as SessionLogOffsetType } from '@deepseek-ai/dsh-session'
 import type {
@@ -698,6 +699,33 @@ function decodeCronRecord(value: Record<string, unknown>): CronScheduleRecord {
  * @returns Detached frozen record; malformed fields throw ScheduleLogError.
  */
 export function decodeScheduleRecord(value: unknown): ScheduleRecord {
+  if (isRecord(value)) {
+    const { activeWindow, notification, retain, ...core } = value
+    if (activeWindow !== undefined || notification !== undefined || retain !== undefined) {
+      const options = decodeDeliveryOptions({
+        ...(activeWindow === undefined ? {} : { activeWindow }),
+        ...(notification === undefined ? {} : { notification }),
+        ...(retain === undefined ? {} : { retain }),
+      })
+      return Object.freeze({ ...decodeScheduleRecord(core), ...options })
+    }
+    if (value['kind'] === 'idle') {
+      if (!hasExactKeys(value, ['id', 'kind', 'title', 'prompt', 'idleSeconds', 'quietSince', 'scheduledAt'])) {
+        throw new ScheduleLogError('Invalid idle schedule fields')
+      }
+      const quietSince = decodeInstant(value['quietSince'])
+      const scheduledAt = decodeInstant(value['scheduledAt'])
+      try {
+        const record = createIdleScheduleRecord(decodeId(value['id']), value['prompt'] as string,
+          value['idleSeconds'] as number, Date.parse(quietSince), decodeStoredTitle(value['title']))
+        if (record.prompt !== value['prompt']) throw new ScheduleLogError('Idle prompt must be trimmed')
+        return Object.freeze({ ...record, scheduledAt })
+      } catch (error) {
+        if (error instanceof ScheduleInputError) throw new ScheduleLogError(error.message)
+        throw error
+      }
+    }
+  }
   if (isRecord(value) && value['kind'] === 'daily') return decodeDailyRecord(value)
   if (isRecord(value) && value['kind'] === 'weekly') return decodeWeeklyRecord(value)
   if (isRecord(value) && value['kind'] === 'cron') return decodeCronRecord(value)

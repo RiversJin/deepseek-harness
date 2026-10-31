@@ -25,7 +25,7 @@ Schedule delivers one-shot, fixed-rate, daily, weekly, and cron wall-clock remin
 
 The shipped Web bundle mounts the service alongside storage-domain and the Session controller. Its `Config` states `deliveryHistoryDays` (default 30) and `deliveryHistoryRecords` (default 200). Storage backend routing belongs to storage-domain; Session model and preset restoration belong to the Session controller. Schedule cannot be mounted alone in a headless or SDK-only composition: delivery requires the Host Web Session controller and a Session persistence backend, because a delivery commits only after the Session acknowledges `session/flush`.
 
-The Agent receives `schedule_create`, `schedule_list`, `schedule_delete`, and `schedule_update`. Update replaces the name, instruction, or timing of one reminder in place and keeps its id and saved records; it is not offered for the relative `after` delay. Creation requires a non-empty prompt, a title, and exactly one of six selectors:
+The Agent receives `schedule_create`, `schedule_list`, `schedule_delete`, and `schedule_update`. Update replaces the name, instruction, or timing of one reminder in place and keeps its id and saved records; it is not offered for the relative `after` delay. Creation requires a non-empty prompt, a title, and exactly one of seven selectors:
 
 | Selector | Example | Timing |
 |---|---|---|
@@ -35,6 +35,15 @@ The Agent receives `schedule_create`, `schedule_list`, `schedule_delete`, and `s
 | `daily` | `{"prompt":"Review today's tasks","title":"Daily review","daily":{"time":"23:00:00","time_zone":"Asia/Shanghai"}}` | Local wall-clock time in an explicit IANA zone. |
 | `weekly` | `{"prompt":"Review the week","title":"Weekly review","weekly":{"time":"09:00:00","time_zone":"Asia/Shanghai","weekdays":[1,3]}}` | Local wall-clock time on an explicit ISO weekday set in an explicit IANA zone. |
 | `cron` | `{"prompt":"Check the deploy","title":"Deploy check","cron":{"expression":"*/15 9-17 * * 1-5","time_zone":"Asia/Shanghai"}}` | Five-field Vixie cron expression evaluated in an explicit IANA zone. |
+| `idle_seconds` | `{"prompt":"[Time passing]","title":"Time passing","idle_seconds":1800}` | Positive quiet duration, with millisecond precision, restarted after each completed round of activity. |
+
+
+
+`active_window` supplies independent daily delivery hours as `{start,end,time_zone}`; clocks use `HH:mm:ss`, with `24:00:00` available as the end. A window may cross midnight. `notification` selects the stored `prompt` or a dynamically rendered `time_passing` reading. The latter uses the window's zone, or UTC without a window. `retain: latest` replaces older notifications from that task in model context; `all` retains them. Original events and subsequent assistant/tool work remain in the Session log. Omitted options keep existing behavior, and updates preserve each omitted choice.
+
+Idle tasks wait for active model/tool work and maintenance to settle, then start a new quiet interval. An opening window admits a notification immediately when the quiet interval has already elapsed; otherwise the remaining quiet interval still applies. Restart restores the same task and its activity anchor. A durable inbox receipt can complete an interrupted task acknowledgment. The `timePassingSessions` configuration lists original Session ids that receive the persistent time-passing explanation through native input admission, including presets with a complete system prompt. This explanation grants ordinary turn choice; the model may use its normal tools or finish quietly.
+
+Older Schedule builds reject the new idle records and delivery fields. A rollback must archive/remove idle tasks and strip the additional delivery fields from retained ordinary tasks, or restore the consistent pre-change Schedule snapshot.
 
 Every creation must supply `title`, which names the task in the model views, the task list, the detail heading, and the reminder catalog. The title is trimmed and must remain non-empty and at most 120 characters; a missing, blank, or over-long title returns `invalid_prompt`. Creation never derives a title from the instruction. Decoding requires the stored title too: a record whose `title` is missing, blank after trimming, untrimmed, or over-long is rejected, so records written before titles existed are not read.
 

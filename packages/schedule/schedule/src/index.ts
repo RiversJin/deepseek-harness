@@ -9,9 +9,12 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionActivity } from '@deepseek-ai/dsh-workspace'
 import { ScheduleRuntime } from './runtime.ts'
 import { registerScheduleTools } from './tools.ts'
+import { registerScheduleContext } from './context.ts'
+import { scheduleActivityProjection } from './activity.ts'
 import { scheduleDomain } from './storage.ts'
 import { deliveryHistoryPage } from './delivery-history.ts'
 import { resolveScheduleUpdate } from './update.ts'
+import { afterActivity, createIdleScheduleRecord, deliveryOptions } from './idle.ts'
 import {
   foldScheduleEvents, ScheduleInputError, ScheduleLogError, ScheduleId, createAfterScheduleRecord, createAtScheduleRecord,
   createEveryScheduleRecord, createDailyScheduleRecord, createWeeklyScheduleRecord, createCronScheduleRecord,
@@ -24,6 +27,7 @@ import type {
 } from './types.ts'
 
 export type * from './types.ts'
+export { afterActivity, createIdleScheduleRecord, nextInWindow } from './idle.ts'
 export { registerScheduleTools } from './tools.ts'
 export { scheduleDomain } from './storage.ts'
 export type { ScheduleTask } from './storage.ts'
@@ -71,6 +75,8 @@ declare module '@deepseek-ai/cordis' {
 
 /** Configuration for the Host Schedule domain. */
 export interface Config {
+  /** Original sessions receiving the time-passing task explanation. */
+  timePassingSessions?: string[]
   /**
    * Delivery-history window retained per task, in days; omission defaults to 30.
    * Pruning happens when an acknowledgment is appended, and `lastDelivery` is always retained.
@@ -98,9 +104,10 @@ const DEFAULT_DELIVERY_HISTORY_RECORDS = 200
  * service is the plugin that registers that listener.
  */
 export class ScheduleService extends TypertRemoteService {
-  static inject = ['agents', 'sessions', 'tools', 'storageDomain', 'sessionController', 'sessionPersistence']
+  static inject = ['agents', 'sessions', 'tools', 'sessionProjections', 'storageDomain', 'sessionController', 'sessionPersistence']
 
   static Config: z<Config> = z.object({
+    timePassingSessions: z.array(z.string()).default([]),
     deliveryHistoryDays: z.number().step(1).min(1).max(3650).default(DEFAULT_DELIVERY_HISTORY_DAYS),
     deliveryHistoryRecords: z.number().step(1).min(1).max(10_000).default(DEFAULT_DELIVERY_HISTORY_RECORDS),
   })
@@ -119,6 +126,7 @@ export class ScheduleService extends TypertRemoteService {
    */
   constructor(ctx: Context, config: Config) {
     super(ctx, 'schedule')
+    ctx.sessionProjections.register(scheduleActivityProjection)
     this.retention = {
       days: config.deliveryHistoryDays ?? DEFAULT_DELIVERY_HISTORY_DAYS,
       records: config.deliveryHistoryRecords ?? DEFAULT_DELIVERY_HISTORY_RECORDS,
@@ -172,10 +180,14 @@ export class ScheduleService extends TypertRemoteService {
       // The plugin-scope effect is what tears the Agent-scoped registration down when this
       // plugin unloads, so it must also be disposed when the Agent itself is released.
       attached.set(agent, ctx.effect(
-        () => agent.ctx.effect(() => registerScheduleTools(ctx, agent.ctx, agent)),
+        () => agent.ctx.effect(() => {
+          const tools = registerScheduleTools(ctx, agent.ctx, agent)
+          const context = registerScheduleContext(agent, config.timePassingSessions?.includes(agent.session.id) ?? false, () => this.list({ sessionId: agent.session.id }))
+          return () => { context(); tools() }
+        }),
       ))
     }
-    ctx.on('agent/created', ({ agent }) => { attach(agent) })
+    ctx.on('agent/created', ({ agent }) => { attach(agent); return undefined })
     ctx.on('agent/disposed', ({ agent }) => {
       const detach = attached.get(agent)
       if (detach === undefined) return
@@ -249,14 +261,16 @@ export class ScheduleService extends TypertRemoteService {
   async create(sessionId: SessionId, request: ScheduleCreateRequest, signal?: AbortSignal): Promise<ScheduleRecord> {
     if (Number(request.at !== undefined) + Number(request.after_seconds !== undefined)
       + Number(request.every_seconds !== undefined) + Number(request.daily !== undefined)
-      + Number(request.weekly !== undefined) + Number(request.cron !== undefined) > 1) {
+      + Number(request.weekly !== undefined) + Number(request.cron !== undefined) + Number(request.idle_seconds !== undefined) > 1) {
       throw new ScheduleInputError('invalid_selector', 'Exactly one reminder selector is required.')
     }
     const title = scheduleTitle(request.title)
     const id = ScheduleId(`schedule-${randomUUID()}`)
     const now = Date.now()
     let record: ScheduleRecord
-    if (request.at !== undefined) {
+    if (request.idle_seconds !== undefined) {
+      record = createIdleScheduleRecord(id, request.prompt, request.idle_seconds, now, title)
+    } else if (request.at !== undefined) {
       record = createAtScheduleRecord(id, request.prompt, request.at, now, title)
     }
     else if (request.after_seconds !== undefined) {
@@ -269,6 +283,8 @@ export class ScheduleService extends TypertRemoteService {
     else if (request.weekly !== undefined) record = createWeeklyScheduleRecord(id, request.prompt, request.weekly, now, title)
     else if (request.cron !== undefined) record = createCronScheduleRecord(id, request.prompt, request.cron, now, title)
     else throw new ScheduleInputError('invalid_selector', 'Exactly one reminder selector is required.')
+    record = { ...record, ...deliveryOptions({}, request) }
+    if (record.kind === 'idle') record = afterActivity(record, now)
     return this.serialize(async () => {
       const domain = await this.getDomain()
       signal?.throwIfAborted()

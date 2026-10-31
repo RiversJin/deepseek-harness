@@ -13,8 +13,40 @@ import type {} from '@deepseek-ai/dsh-workspace/types'
 /** Stable globally unique reminder identity. */
 export type ScheduleId = Branded<'ScheduleId'>
 
+/** Daily delivery hours in an explicit local time zone. */
+export interface ScheduleActiveWindow {
+  readonly start: string
+  readonly end: string
+  readonly time_zone: string
+}
+
+/** Delivery choices stored with a task independently of its timing rule. */
+export interface ScheduleDeliveryOptions {
+  readonly activeWindow?: ScheduleActiveWindow
+  readonly notification?: 'prompt' | 'time_passing'
+  readonly retain?: 'all' | 'latest'
+}
+
+/** Delivery choices accepted by task creation and updates. */
+export interface ScheduleDeliveryInput {
+  readonly active_window?: ScheduleActiveWindow
+  readonly notification?: 'prompt' | 'time_passing'
+  readonly retain?: 'all' | 'latest'
+}
+
+/** Recurring notification anchored to the end of session activity. */
+export interface IdleScheduleRecord extends ScheduleDeliveryOptions {
+  readonly id: ScheduleId
+  readonly kind: 'idle'
+  readonly title: string
+  readonly prompt: string
+  readonly idleSeconds: number
+  readonly quietSince: string
+  readonly scheduledAt: string
+}
+
 /** Durable one-shot reminder created from a positive delay. */
-export interface AfterScheduleRecord {
+export interface AfterScheduleRecord extends ScheduleDeliveryOptions {
   /** Globally unique task identity. */
   readonly id: ScheduleId
   /** Rule discriminator for a delayed one-shot reminder. */
@@ -30,7 +62,7 @@ export interface AfterScheduleRecord {
 }
 
 /** Durable one-shot reminder created from an absolute instant. */
-export interface AtScheduleRecord {
+export interface AtScheduleRecord extends ScheduleDeliveryOptions {
   /** Globally unique task identity. */
   readonly id: ScheduleId
   /** Rule discriminator for an absolute one-shot reminder. */
@@ -44,7 +76,7 @@ export interface AtScheduleRecord {
 }
 
 /** Durable fixed-rate reminder aligned to creation or its most recent interval edit. */
-export interface EveryScheduleRecord {
+export interface EveryScheduleRecord extends ScheduleDeliveryOptions {
   /** Globally unique task identity. */
   readonly id: ScheduleId
   /** Rule discriminator for a fixed-rate recurring reminder. */
@@ -60,7 +92,7 @@ export interface EveryScheduleRecord {
 }
 
 /** Durable daily wall-clock reminder; gaps skip a date and overlaps use the earlier instant. */
-export interface DailyScheduleRecord {
+export interface DailyScheduleRecord extends ScheduleDeliveryOptions {
   /** Globally unique task identity. */
   readonly id: ScheduleId
   /** Rule discriminator for a daily wall-clock reminder. */
@@ -78,7 +110,7 @@ export interface DailyScheduleRecord {
 }
 
 /** Durable weekly wall-clock reminder; gaps skip a date and overlaps use the earlier instant. */
-export interface WeeklyScheduleRecord {
+export interface WeeklyScheduleRecord extends ScheduleDeliveryOptions {
   /** Globally unique task identity. */
   readonly id: ScheduleId
   /** Rule discriminator for a weekly wall-clock reminder. */
@@ -98,7 +130,7 @@ export interface WeeklyScheduleRecord {
 }
 
 /** Durable cron wall-clock reminder; gaps skip a date and overlaps use the earlier instant. */
-export interface CronScheduleRecord {
+export interface CronScheduleRecord extends ScheduleDeliveryOptions {
   /** Globally unique task identity. */
   readonly id: ScheduleId
   /** Rule discriminator for a five-field cron wall-clock reminder. */
@@ -191,7 +223,7 @@ export type LegacyScheduleRecord =
 export type RecurringScheduleRecord = EveryScheduleRecord | DailyScheduleRecord | WeeklyScheduleRecord | CronScheduleRecord
 
 /** Reminder rule and target, stored with its original Session binding. */
-export type ScheduleRecord = OneShotScheduleRecord | RecurringScheduleRecord
+export type ScheduleRecord = OneShotScheduleRecord | RecurringScheduleRecord | IdleScheduleRecord
 
 /** Durable Session inbox delivery acknowledgment, not model execution completion. */
 export interface ScheduleDeliveryReceipt {
@@ -360,7 +392,9 @@ declare module '@deepseek-ai/dsh-session/types' {
 }
 
 /** Reminder creation selector, shared by the model consumer and Host service. */
-export interface ScheduleCreateRequest {
+export interface ScheduleCreateRequest extends ScheduleDeliveryInput {
+  /** Quiet duration after each completed round of activity. */
+  idle_seconds?: number
   /** Non-empty reminder text. */
   prompt: string
   /** Required task name of at most 120 characters, non-empty after trimming; names the card, detail heading, and task lists. */
@@ -393,6 +427,7 @@ export interface ScheduleDeleteRequest extends ScheduleListRequest {
 
 /** Timing-only edit; it may select a different recurrence kind than the stored record, and one-shot targets use an absolute `at`. */
 export type ScheduleTimingChange =
+  | { readonly kind: 'idle'; readonly idle_seconds: number }
   | { readonly kind: 'at'; readonly at: AtInput }
   | { readonly kind: 'every'; readonly every_seconds: number }
   | { readonly kind: 'daily'; readonly daily: DailyInput }
@@ -400,7 +435,7 @@ export type ScheduleTimingChange =
   | { readonly kind: 'cron'; readonly cron: CronInput }
 
 /** Replacement task name and instruction carried by one compare-and-update request. */
-export interface ScheduleUpdateContent {
+export interface ScheduleUpdateContent extends ScheduleDeliveryInput {
   /** Task name of at most 120 characters, non-empty after trimming; omitted keeps the stored name. */
   readonly title?: string
   /** Reminder instruction, non-empty after trimming; omitted keeps the stored instruction. */

@@ -11,6 +11,8 @@ English | [中文](README.zh.md)
 
 Manage active and inactive tasks from the Automation tasks page and the right Sidebar task tab: search, filter, edit name, instruction, and run time, browse records, delete, or open the original conversation. Every surface names a task by its title. An open Session's header shows an icon-only reminder clock while active reminders exist and opens that task's detail; a `schedule_create` call renders a transcript card; an idle, unarchived Session row with active tasks shows a clock mark and hover list.
 
+Idle tasks display their quiet interval and permit interval edits while preserving their daily delivery window, notification kind, and context-retention choices. The task snapshot includes these stored choices in compare-and-update requests.
+
 ## Table of Contents
 
 - [Use this package](#use-this-package)

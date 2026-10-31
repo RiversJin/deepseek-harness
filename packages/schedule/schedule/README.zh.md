@@ -25,7 +25,7 @@ Schedule 将一次性、固定周期、按每日、按每周以及 cron 本地�
 
 发布的 Web bundle 将此服务与 storage-domain、Session controller 一起挂载。其 `Config` 声明 `deliveryHistoryDays`（默认 30）与 `deliveryHistoryRecords`（默认 200）。存储后端路由由 storage-domain 管理；会话模型与 preset 恢复由 Session controller 管理。Schedule 无法在 headless 或仅 SDK 的组合中单独挂载：投递需要 Host 的 Web Session controller 和 Session 持久化后端，因为只有在 Session 确认 `session/flush` 之后一次投递才会提交。
 
-Agent 获得 `schedule_create`、`schedule_list`、`schedule_delete` 和 `schedule_update`。更新原地替换一条提醒的名称、指令或时间，保留其 id 与已保存记录；相对的 `after` 延迟不支持更新。创建时需要非空提示文本、标题，且必须只提供以下六个选择器之一：
+Agent 获得 `schedule_create`、`schedule_list`、`schedule_delete` 和 `schedule_update`。更新原地替换一条提醒的名称、指令或时间，保留其 id 与已保存记录；相对的 `after` 延迟不支持更新。创建时需要非空提示文本、标题，且必须只提供以下七个选择器之一：
 
 | 选择器 | 示例 | 时间语义 |
 |---|---|---|
@@ -35,6 +35,15 @@ Agent 获得 `schedule_create`、`schedule_list`、`schedule_delete` 和 `schedu
 | `daily` | `{"prompt":"Review today's tasks","title":"Daily review","daily":{"time":"23:00:00","time_zone":"Asia/Shanghai"}}` | 显式 IANA 时区中的本地钟表时间。 |
 | `weekly` | `{"prompt":"Review the week","title":"Weekly review","weekly":{"time":"09:00:00","time_zone":"Asia/Shanghai","weekdays":[1,3]}}` | 显式 IANA 时区中、按显式 ISO 星期集合触发的本地钟表时间。 |
 | `cron` | `{"prompt":"Check the deploy","title":"Deploy check","cron":{"expression":"*/15 9-17 * * 1-5","time_zone":"Asia/Shanghai"}}` | 在显式 IANA 时区中求值的五字段 Vixie cron 表达式。 |
+| `idle_seconds` | `{"prompt":"[Time passing]","title":"Time passing","idle_seconds":1800}` | 大于零、精确到毫秒的静默时长；每轮活动结束后重新计时。 |
+
+
+`active_window` 用 `{start,end,time_zone}` 独立指定每日投递时段；时间使用 `HH:mm:ss`，结束时间可为 `24:00:00`，也可设置跨午夜时段。`notification` 选择任务保存的 `prompt` 或投递时动态生成的 `time_passing` 时间读数；后者采用窗口时区，没有窗口时采用 UTC。`retain: latest` 在模型上下文中替换同一任务的旧通知，`all` 保留通知。原始事件及随后产生的助手行为和工具操作仍保存在会话日志中。省略这些选项沿用已有行为，更新时省略的选项保留原值。
+
+静默任务等待模型、工具和维护活动结束，再开始新的静默间隔。每日窗口打开时，已满足静默时长即可立即投递，否则继续等待剩余时长。重启恢复同一任务及活动时间起点；已持久化的收件箱记录可完成中断的任务确认。配置 `timePassingSessions` 列出需要常驻时间通知说明的原始会话 id，说明经原生输入流程进入上下文，也适用于完整系统提示的 preset。模型可以使用普通工具，也可以安静结束本轮。
+
+旧版 Schedule 会拒绝新的静默任务和投递字段。回退时需归档并移除静默任务、去掉普通任务的新增投递字段，或恢复一致的变更前 Schedule 快照。
+
 
 每次创建都必须提供 `title`，用于在模型视图、任务列表、详情标题和提醒目录中命名任务。标题会去除首尾空白，之后必须仍然非空且不超过 120 个字符；缺失、空白或过长时返回 `invalid_prompt`。创建过程绝不从指令派生标题。解码同样要求已存储的标题：`title` 缺失、去除首尾空白后为空、带首尾空白或超过 120 个字符的记录会被拒绝，因此在标题存在之前写入的记录不会被读取。
 
