@@ -77,6 +77,8 @@ function record(
       timeZone: options.timeZone ?? 'Asia/Shanghai',
     }
   }
+  // Local patch: idle tasks re-arm after each quiet period.
+  if (kind === 'idle') return { ...common, kind, idleSeconds: options.everySeconds ?? 1800, quietSince: common.scheduledAt }
   return { ...common, kind }
 }
 
